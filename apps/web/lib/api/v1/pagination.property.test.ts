@@ -3,7 +3,13 @@ import test from 'node:test';
 import fc from 'fast-check';
 import { StrKey } from '@stellar/stellar-sdk';
 import type { ProfileContractsDbRow } from '../../profile-contracts.ts';
-import { encodeCursor, parseCursor, V1Error } from './http.ts';
+import {
+  encodeCursor,
+  parseCursor,
+  parseOperationsCursor,
+  V1Error,
+  type V1OperationsCursor,
+} from './http.ts';
 import { getV1ProfileContracts, type V1ProfileContractsCursor } from './profile-contracts.ts';
 import { getV1ProfileOperations } from './profile-operations.ts';
 
@@ -40,6 +46,7 @@ async function walk<Cursor>(
   expected: string[],
   read: (cursor: Cursor | null) => Promise<{ ids: string[]; next: string | null }>,
   insert: (id: number, tick: number) => void,
+  decode: (raw: string) => Cursor | null = (raw) => parseCursor<Cursor>(raw),
 ): Promise<void> {
   const { limit, ticks, inserts } = scenario;
   const seen = new Set<string>();
@@ -62,7 +69,7 @@ async function walk<Cursor>(
     }
     assert.ok(!cursors.has(next), 'server returned a repeated cursor');
     cursors.add(next);
-    cursor = parseCursor<Cursor>(next);
+    cursor = decode(next);
     assert.notEqual(cursor, null, 'a continuation cursor must decode to a payload');
     for (let n = inserts[page] ?? 0; n > 0; n--) insert(id++, ++tick);
   }
@@ -119,7 +126,14 @@ test('contract pagination walks the original rows through timestamp ties and hea
   );
 });
 
-function operationRow(i: number, tick: number) {
+interface OperationRow {
+  id: string;
+  type: string;
+  createdAt: Date;
+  successful: boolean;
+}
+
+function operationRow(i: number, tick: number): OperationRow {
   return {
     id: String(i).padStart(6, '0'),
     type: 'invoke_host_function',
@@ -128,42 +142,77 @@ function operationRow(i: number, tick: number) {
   };
 }
 
-// Enable this property when #968 replaces the operations offset with a keyset cursor.
-test.skip('operation pagination walks the original rows through timestamp ties and head inserts', async () => {
+/** Same order as `getPagedOperations`: createdAt desc, then id desc. */
+function compareOperations(a: OperationRow, b: OperationRow): number {
+  return b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
+}
+
+/**
+ * In-memory `getPagedOperations`. A number is an offset (the first page); an
+ * object cursor is the keyset `(createdAt, id)` the database applies, so a row
+ * inserted newer than the head never shifts or repeats a later page.
+ */
+function pageOperations(
+  rows: OperationRow[],
+  pagination: unknown,
+  limit: number,
+): { data: OperationRow[]; total: number; hasMore: boolean } {
+  let keyset: { createdAt: string; id: string } | null = null;
+  let offset: number | undefined;
+  let actualLimit = limit;
+  if (typeof pagination === 'number') {
+    offset = pagination;
+  } else if (typeof pagination === 'object' && pagination !== null) {
+    const page = pagination as {
+      cursor?: { createdAt: string; id: string } | null;
+      offset?: number;
+      limit?: number;
+    };
+    keyset = page.cursor ?? null;
+    offset = page.offset;
+    if (page.limit !== undefined) actualLimit = page.limit;
+  }
+
+  const sorted = [...rows].sort(compareOperations);
+  let visible: OperationRow[];
+  if (keyset) {
+    const cursor = keyset;
+    visible = sorted.filter((op) => {
+      const opTime = op.createdAt.getTime();
+      const cursorTime = new Date(cursor.createdAt).getTime();
+      if (opTime !== cursorTime) return opTime < cursorTime;
+      return op.id < cursor.id;
+    });
+  } else {
+    visible = sorted.slice(offset ?? 0);
+  }
+  const hasMore = visible.length > actualLimit;
+  return { data: hasMore ? visible.slice(0, actualLimit) : visible, total: rows.length, hasMore };
+}
+
+test('operation pagination walks the original rows through timestamp ties and head inserts', async () => {
   await fc.assert(
     fc.asyncProperty(scenarios, async (scenario) => {
       const original = scenario.ticks.map((tick, i) => operationRow(i, tick));
       const rows = [...original];
-      const expected = [...original]
-        .sort(
-          (a, b) => b.createdAt.getTime() - a.createdAt.getTime() || Number(b.id) - Number(a.id),
-        )
-        .map(({ id }) => id);
-      await walk<{ offset: number }>(
+      const expected = [...original].sort(compareOperations).map(({ id }) => id);
+      await walk<V1OperationsCursor>(
         scenario,
         expected,
         async (cursor) => {
-          // Exercise main's offset seam until #968 supplies the keyset seam.
-          // Fulfil the requested offset against the live list on every read.
           const { data, meta } = await getV1ProfileOperations(
             'alice',
-            { ...cursor, limit: scenario.limit },
+            { cursor, limit: scenario.limit },
             {
-              getPagedOperations: async (_handle, offset, limit) => ({
-                data: [...rows]
-                  .sort(
-                    (a, b) =>
-                      b.createdAt.getTime() - a.createdAt.getTime() || (a.id > b.id ? -1 : 1),
-                  )
-                  .slice(offset, offset + limit),
-                total: rows.length,
-              }),
+              getPagedOperations: async (_handle, pagination, limit) =>
+                pageOperations(rows, pagination, limit),
             },
           );
           assert.equal(meta.source, 'database');
           return { ids: data.map(({ id }) => id), next: meta.nextCursor };
         },
         (i, tick) => rows.unshift(operationRow(i, tick)),
+        (raw) => parseOperationsCursor(raw),
       );
     }),
     { ...options, examples: boundaryCases },
